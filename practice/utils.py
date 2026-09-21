@@ -143,46 +143,63 @@ def rename_images_by_team_format(team_df, image_root="../image"):
 
 
 # 7. 이름 변경 함수 (삭제 후)
-def renumber_images(image_root="../image"):
-    """
-    수작업으로 사진을 지운 뒤, 남은 임시ID 파일들의 -1, -2 ... 번호를 다시 순서대로 채번.
-    파일이 1장만 남으면 번호(suffix)를 없애고, 2장 이상이면 -1, -2 ...로 다시 매김.
-    """
-    pattern = re.compile(r'^(Y[A-Za-z0-9]+?)(?:-(\d+))?\.jpg$', re.IGNORECASE)
+def renumber_images(team_df, image_root="../image"):
+    folder_map = {"흉배": "hyungbae", "단령": "dallyeong", "초상": "portrait"}
+    team_df = team_df.reset_index(drop=True).copy()
+    id_pattern = re.compile(r'^(Y[A-Za-z]+?)(\d{2})$')
 
-    for folder in ["hyungbae", "dallyeong", "portrait"]:
+    # 1. 임시ID 접두어(예: YNFMP)별로 그룹핑 — 기존 순서(=원래 채번 순서) 그대로 유지
+    prefix_groups = defaultdict(list)
+    for idx, row in team_df.iterrows():
+        m = id_pattern.match(str(row["임시ID"]))
+        prefix = m.group(1) if m else str(row["임시ID"])
+        prefix_groups[prefix].append(idx)
+
+    # 2. old_id -> new_id 매핑 생성 (01,02,03... 로 압축)
+    rename_plan = []
+    for prefix, idxs in prefix_groups.items():
+        for new_num, idx in enumerate(idxs, start=1):
+            old_id = team_df.at[idx, "임시ID"]
+            new_id = f"{prefix}{new_num:02d}"
+            folder = folder_map.get(team_df.at[idx, "분류"])
+            rename_plan.append((idx, old_id, new_id, folder))
+
+    # 3. 이미지 파일 rename (old_id-* -> new_id-*, 서픽스도 1,2,3...으로 정리)
+    for idx, old_id, new_id, folder in rename_plan:
+        if old_id == new_id or folder is None:
+            continue
         folder_path = os.path.join(image_root, folder)
         if not os.path.isdir(folder_path):
             continue
+        pattern = re.compile(rf'^{re.escape(old_id)}(?:-(\d+))?\.jpg$', re.IGNORECASE)
+        matches = sorted(
+            [f for f in os.listdir(folder_path) if pattern.match(f)],
+            key=lambda f: int(pattern.match(f).group(1) or 1)
+        )
+        temp_paths = []
+        for fname in matches:
+            old_path = os.path.join(folder_path, fname)
+            temp_path = os.path.join(folder_path, f"__tmp__{fname}")
+            os.replace(old_path, temp_path)
+            temp_paths.append(temp_path)
+        for i, temp_path in enumerate(temp_paths):
+            suffix = "" if len(temp_paths) == 1 else f"-{i + 1}"
+            new_path = os.path.join(folder_path, f"{new_id}{suffix}.jpg")
+            os.replace(temp_path, new_path)
 
-        groups = defaultdict(list)
-        for fname in os.listdir(folder_path):
-            m = pattern.match(fname)
-            if not m:
-                continue
-            groups[m.group(1)].append(fname)
+    # 4. 데이터프레임 임시ID 갱신
+    for idx, old_id, new_id, folder in rename_plan:
+        team_df.at[idx, "임시ID"] = new_id
 
-        for base_id, files in groups.items():
-            files.sort()
-
-            # 1) 이름 충돌 방지를 위해 먼저 임시 이름으로 바꿔둠
-            temp_paths = []
-            for fname in files:
-                old_path = os.path.join(folder_path, fname)
-                temp_path = os.path.join(folder_path, f"__tmp__{fname}")
-                os.replace(old_path, temp_path)
-                temp_paths.append(temp_path)
-
-            # 2) 정리된 이름으로 최종 부여
-            for idx, temp_path in enumerate(temp_paths):
-                suffix = "" if len(temp_paths) == 1 else f"-{idx + 1}"
-                new_path = os.path.join(folder_path, f"{base_id}{suffix}.jpg")
-                os.replace(temp_path, new_path)
-
-    print("번호 재정렬 완료")
+    changed = [(o, n) for _, o, n, _ in rename_plan if o != n]
+    if changed:
+        print(f"재채번된 항목: {len(changed)}건")
+        for o, n in changed:
+            print(f"  {o} -> {n}")
+    return team_df
 
 
-# 8. 이름 바뀐 이미지 눈으로 확인하는 갤러리 (04번 수작업 확인용)
+# 8. 이름 바뀐 이미지 눈으로 확인하는 함수 (04번 수작업 확인용)
 def build_review_gallery(team_df, image_root="../image", thumb_width=180):
     folder_map = {"흉배": "hyungbae", "단령": "dallyeong", "초상": "portrait"}
     cards = []
@@ -244,3 +261,26 @@ def sync_image_urls_with_files(team_df, image_root="../image"):
     team_df["image_url"] = new_image_url
     team_df["image_urls"] = new_image_urls
     return team_df
+
+# 10. 사진을 지운 유물의 경우 엑셀에서도 행 삭제시키는 함수
+def prune_deleted_items(team_df, image_root="../image"):
+    folder_map = {"흉배": "hyungbae", "단령": "dallyeong", "초상": "portrait"}
+    keep_mask = []
+
+    for _, row in team_df.iterrows():
+        folder = folder_map.get(row["분류"])
+        temp_id = row["임시ID"]
+        if folder is None:
+            keep_mask.append(True)
+            continue
+        matches = glob.glob(os.path.join(image_root, folder, f"{temp_id}*.jpg"))
+        keep_mask.append(len(matches) > 0)
+
+    keep_mask = pd.Series(keep_mask, index=team_df.index)
+    removed = team_df[~keep_mask]
+    kept = team_df[keep_mask].reset_index(drop=True)
+
+    if len(removed) > 0:
+        print(f"사진이 하나도 안 남아서 제외된 유물: {len(removed)}건 -> {removed['임시ID'].tolist()}")
+
+    return kept
